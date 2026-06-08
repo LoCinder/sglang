@@ -1,0 +1,288 @@
+diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
+index 022446b..5ea2d4b 100644
+--- a/python/sglang/srt/disaggregation/decode.py
++++ b/python/sglang/srt/disaggregation/decode.py
+@@ -1726,6 +1726,19 @@ class SchedulerDisaggregationDecodeMixin:
+             if self.last_batch:
+                 tmp_batch, tmp_result = self.result_queue.popleft()
+                 self.process_batch_result(tmp_batch, tmp_result)
++                if tmp_batch.forward_mode.is_extend() and any(
++                    getattr(req, "is_pd_local_prefill", False) for req in tmp_batch.reqs
++                ):
++                    local_batch = self.last_batch
++                    last_bs = local_batch.batch_size()
++                    local_batch.filter_batch()
++                    if local_batch.batch_size() < last_bs:
++                        self.running_batch.batch_is_full = False
++                    if not local_batch.is_empty():
++                        if self.running_batch.is_empty() or self.running_batch.sampling_info is None:
++                            self.running_batch = local_batch
++                        else:
++                            self.running_batch.merge_batch(local_batch)
+             elif batch is None:
+                 self.on_idle()
+ 
+@@ -1750,7 +1763,23 @@ class SchedulerDisaggregationDecodeMixin:
+     def get_next_disagg_decode_batch_to_run(
+         self: Scheduler,
+     ) -> Optional[ScheduleBatch]:
+-        """Process prebuilt batch and schedule the next decode batch."""
++        """Process local/prebuilt batches and schedule the next decode batch."""
++        if self.last_batch and self.last_batch.forward_mode.is_extend():
++            last_bs = self.last_batch.batch_size()
++            self.last_batch.filter_batch()
++            if self.last_batch.batch_size() < last_bs:
++                self.running_batch.batch_is_full = False
++            if not self.last_batch.is_empty():
++                if self.running_batch.is_empty() or self.running_batch.sampling_info is None:
++                    self.running_batch = self.last_batch
++                else:
++                    self.running_batch.merge_batch(self.last_batch)
++
++        local_prefill_batch = self.get_new_local_prefill_batch()
++        if local_prefill_batch:
++            set_schedule_time_batch(local_prefill_batch)
++            return local_prefill_batch
++
+         # Process pending prebuilt batch: output processing + filter + merge
+         new_prebuilt_batch = self.get_new_prebuilt_batch()
+         if new_prebuilt_batch:
+@@ -1781,6 +1810,25 @@ class SchedulerDisaggregationDecodeMixin:
+             set_schedule_time_batch(ret)
+         return ret
+ 
++    def get_new_local_prefill_batch(self: Scheduler) -> Optional[ScheduleBatch]:
++        """Schedule decode-local requests as ordinary prefill work on the D worker."""
++        if not any(getattr(req, "is_pd_local_prefill", False) for req in self.waiting_queue):
++            return None
++
++        local_queue = []
++        remote_queue = []
++        for req in self.waiting_queue:
++            if getattr(req, "is_pd_local_prefill", False):
++                local_queue.append(req)
++            else:
++                remote_queue.append(req)
++
++        self.waiting_queue = local_queue
++        batch = self.get_new_batch_prefill()
++        remaining_local_queue = self.waiting_queue
++        self.waiting_queue = remote_queue + remaining_local_queue
++        return batch
++
+     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
+         """Create a schedulebatch for fake completed prefill"""
+         if self.grammar_manager.has_waiting_grammars():
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index d1a7d2c..0980350 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1958,10 +1958,18 @@ class Scheduler(
+             req.tokenizer = self.tokenizer
+ 
+             if self.disaggregation_mode != DisaggregationMode.NULL:
+-                # Invalid request for disaggregated mode
++                is_pd_local_prefill = (
++                    self.disaggregation_mode == DisaggregationMode.DECODE
++                    and recv_req.bootstrap_room is None
++                )
++                if is_pd_local_prefill:
++                    req.is_pd_local_prefill = True
++
++                # Invalid request for disaggregated mode, except decode-local prefill shortcuts.
+                 if (
+                     recv_req.bootstrap_room is None
+                     and self.transfer_backend != TransferBackend.FAKE
++                    and not is_pd_local_prefill
+                 ):
+                     error_msg = (
+                         f"Invalid request: Disaggregated request received without "
+@@ -2169,11 +2177,18 @@ class Scheduler(
+             )
+             req.time_stats.set_prefill_bootstrap_queue_entry_time()
+         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+-            self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
+-            if not is_retracted:
+-                req.time_stats.set_decode_prealloc_queue_entry_time()
++            if getattr(req, "is_pd_local_prefill", False):
++                if self._abort_on_queued_limit(req):
++                    return
++                self._prefetch_kvcache(req)
++                self.waiting_queue.append(req)
++                req.time_stats.set_wait_queue_entry_time()
+             else:
+-                req.time_stats.set_retract_time()
++                self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
++                if not is_retracted:
++                    req.time_stats.set_decode_prealloc_queue_entry_time()
++                else:
++                    req.time_stats.set_retract_time()
+         else:
+             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+ 
+diff --git a/sgl-model-gateway/bindings/python/src/sglang_router/mini_lb.py b/sgl-model-gateway/bindings/python/src/sglang_router/mini_lb.py
+index 11ef2f4..3decb22 100644
+--- a/sgl-model-gateway/bindings/python/src/sglang_router/mini_lb.py
++++ b/sgl-model-gateway/bindings/python/src/sglang_router/mini_lb.py
+@@ -47,6 +47,7 @@ class MiniLoadBalancer:
+         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
+         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
+         self.decode_urls = router_args.decode_urls
++        self.short_prefill_threshold = router_args.pd_short_prefill_threshold
+         self.test_external_dp_routing = router_args.test_external_dp_routing
+         self.prefill_dp_size = None
+         self.decode_dp_size = None
+@@ -111,6 +112,17 @@ class MiniLoadBalancer:
+             self.decode_urls[didx],
+         )
+ 
++    async def generate_decode_only(
++        self, request, decode_server, endpoint
++    ) -> ORJSONResponse:
++        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
++
++        async with aiohttp.ClientSession(
++            timeout=aiohttp.ClientTimeout(total=self.timeout)
++        ) as session:
++            async with session.post(f"{decode_server}/{endpoint}", json=request) as resp:
++                return ORJSONResponse(content=await resp.json(), status_code=resp.status)
++
+     async def generate(
+         self, modified_request, prefill_server, decode_server, endpoint
+     ) -> ORJSONResponse:
+@@ -170,6 +182,21 @@ class MiniLoadBalancer:
+                 status_code=decode_response.status,
+             )
+ 
++    async def generate_stream_decode_only(
++        self, request, decode_server, endpoint="generate"
++    ):
++        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
++
++        async def stream_results():
++            async with aiohttp.ClientSession(
++                timeout=aiohttp.ClientTimeout(total=self.timeout)
++            ) as session:
++                async with session.post(f"{decode_server}/{endpoint}", json=request) as resp:
++                    async for chunk in resp.content.iter_chunked(AIOHTTP_STREAM_READ_CHUNK_SIZE):
++                        yield chunk
++
++        return StreamingResponse(stream_results(), media_type="text/event-stream")
++
+     async def generate_stream(
+         self, modified_request, prefill_server, decode_server, endpoint="generate"
+     ):
+@@ -357,6 +384,14 @@ async def get_model_info():
+ async def handle_generate_request(request_data: dict):
+     prefill_server, bootstrap_port, decode_server = lb.select_pair()
+ 
++    if await _should_route_decode_only(request_data, decode_server, "generate"):
++        logger.info("[MiniLB] Route short prompt to decode only")
++        if request_data.get("stream", False):
++            return await lb.generate_stream_decode_only(
++                request_data, decode_server, "generate"
++            )
++        return await lb.generate_decode_only(request_data, decode_server, "generate")
++
+     # Parse and transform prefill_server for bootstrap data
+     parsed_url = urllib.parse.urlparse(prefill_server)
+     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
+@@ -395,6 +430,16 @@ async def handle_generate_request(request_data: dict):
+ async def _forward_to_backend(request_data: dict, endpoint_name: str):
+     prefill_server, bootstrap_port, decode_server = lb.select_pair()
+ 
++    if await _should_route_decode_only(request_data, decode_server, endpoint_name):
++        logger.info("[MiniLB] Route short prompt to decode only")
++        if request_data.get("stream", False):
++            return await lb.generate_stream_decode_only(
++                request_data, decode_server, endpoint=endpoint_name
++            )
++        return await lb.generate_decode_only(
++            request_data, decode_server, endpoint=endpoint_name
++        )
++
+     # Parse and transform prefill_server for bootstrap data
+     parsed_url = urllib.parse.urlparse(prefill_server)
+     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
+@@ -433,6 +478,56 @@ async def handle_completion_request(request_data: dict):
+     return await _forward_to_backend(request_data, "v1/completions")
+ 
+ 
++async def _should_route_decode_only(request: dict, decode_server: str, endpoint: str) -> bool:
++    threshold = getattr(lb, "short_prefill_threshold", 0)
++    if threshold <= 0:
++        return False
++
++    prompt_len = await _get_prompt_len(request, decode_server, endpoint)
++    return prompt_len is not None and prompt_len < threshold
++
++
++async def _get_prompt_len(request: dict, decode_server: str, endpoint: str):
++    input_ids = request.get("input_ids")
++    if input_ids is not None:
++        if len(input_ids) == 0:
++            return 0
++        if isinstance(input_ids[0], int):
++            return len(input_ids)
++        return max(len(ids) for ids in input_ids)
++
++    tokenize_payload = None
++    if "text" in request:
++        tokenize_payload = {"prompt": request["text"], "add_special_tokens": False}
++    elif endpoint == "v1/completions" and "prompt" in request:
++        tokenize_payload = {"prompt": request["prompt"], "add_special_tokens": False}
++    elif endpoint == "v1/chat/completions" and "messages" in request:
++        tokenize_payload = {"messages": request["messages"]}
++
++    if tokenize_payload is None:
++        return None
++
++    try:
++        async with aiohttp.ClientSession(
++            timeout=aiohttp.ClientTimeout(total=min(lb.timeout, 30))
++        ) as session:
++            async with session.post(f"{decode_server}/tokenize", json=tokenize_payload) as resp:
++                if resp.status != 200:
++                    logger.warning("[MiniLB] Tokenize failed with status %s", resp.status)
++                    return None
++                data = await resp.json()
++    except Exception:
++        logger.warning("[MiniLB] Tokenize failed", exc_info=True)
++        return None
++
++    count = data.get("count")
++    if isinstance(count, int):
++        return count
++    if isinstance(count, list) and count:
++        return max(count)
++    return None
++
++
+ def _generate_bootstrap_room():
+     return random.randint(0, 2**63 - 1)
+ 
+diff --git a/sgl-model-gateway/bindings/python/src/sglang_router/router_args.py b/sgl-model-gateway/bindings/python/src/sglang_router/router_args.py
+index d02a759..abf1a18 100644
+--- a/sgl-model-gateway/bindings/python/src/sglang_router/router_args.py
++++ b/sgl-model-gateway/bindings/python/src/sglang_router/router_args.py
+@@ -45,6 +45,7 @@ class RouterArgs:
+     mini_lb: bool = False
+     test_external_dp_routing: bool = False
+     pd_disaggregation: bool = False  # Enable PD disaggregated mode
++    pd_short_prefill_threshold: int = 512  # MiniLB: route prompts shorter than this length to decode only
+     prefill_urls: List[tuple] = dataclasses.field(
+         default_factory=list
+     )  # List of (url, bootstrap_port)
+@@ -383,6 +384,12 @@ class RouterArgs:
+             action="store_true",
+             help="Enable PD (Prefill-Decode) disaggregated mode",
+         )
++        pd_group.add_argument(
++            f"--{prefix}pd-short-prefill-threshold",
++            type=int,
++            default=RouterArgs.pd_short_prefill_threshold,
++            help="MiniLB only: prompts with length < this value are sent to decode only for local prefill. Set 0 to disable.",
++        )
+         pd_group.add_argument(
+             f"--{prefix}prefill",
+             nargs="+",
