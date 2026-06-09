@@ -27,7 +27,8 @@ register_cuda_ci(
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
     """
     Test class for verifying KV cache offloading on the decode side in a
-    prefill-decode disaggregation setup.
+    prefill-decode disaggregation setup with decode-side radix cache and
+    hierarchical cache enabled together.
     """
 
     @classmethod
@@ -109,6 +110,8 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
             "1",
             "--base-gpu-id",
             "1",
+            "--enable-hierarchical-cache",
+            "--disaggregation-decode-enable-radix-cache",
             "--disaggregation-decode-enable-offload-kvcache",
             "--num-reserved-decode-tokens",
             "128",
