@@ -1,0 +1,572 @@
+--- a/python/sglang/srt/mem_cache/triton_ops/mla_buffer.py
++++ b/python/sglang/srt/mem_cache/triton_ops/mla_buffer.py
+@@ -362,6 +362,7 @@
+ def set_mla_kv_buffer_fp4_quant_scatter_kernel(
+     kv_buffer_ptr,
+     kv_scale_buffer_ptr,
++    kv_global_scale_ptr,
+     cache_k_nope_ptr,
+     cache_k_rope_ptr,
+     loc_ptr,
+@@ -403,11 +404,15 @@
+     )
+ 
+     block_max = tl.maximum(tl.max(tl.abs(even), axis=0), tl.max(tl.abs(odd), axis=0))
+-    scale_exp = tl.ceil(tl.log2(tl.maximum(block_max / 6.0, 1.0e-10)))
+-    inv_scale = 1.0 / tl.exp2(scale_exp)
++    global_scale = tl.maximum(tl.load(kv_global_scale_ptr).to(tl.float32), 1.0e-12)
++    block_scale = tl.maximum(block_max / (6.0 * global_scale), 1.0e-12)
++    block_scale_fp8 = block_scale.to(tl.float8e4nv)
++    block_scale_f32 = tl.maximum(block_scale_fp8.to(tl.float32), 1.0e-12)
++    inv_scale = 1.0 / (block_scale_f32 * global_scale)
+     low = _fp4_e2m1_quantize(even * inv_scale)
+     high = _fp4_e2m1_quantize(odd * inv_scale)
+     packed = low | (high << 4)
++    scale_u8 = block_scale_fp8.to(tl.uint8, bitcast=True)
+ 
+     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+     packed_base = pid_block * 8
+@@ -419,7 +424,7 @@
+     )
+     tl.store(
+         kv_scale_buffer_ptr + loc * scale_stride + pid_block,
+-        (scale_exp + 127.0).to(tl.uint8),
++        scale_u8,
+         mask=pid_block < tl.cdiv(total_dim, BLOCK_SIZE),
+     )
+ 
+@@ -427,6 +432,7 @@
+ def set_mla_kv_buffer_fp4_quant_scatter_triton(
+     kv_buffer: torch.Tensor,
+     kv_scale_buffer: torch.Tensor,
++    kv_global_scale: torch.Tensor,
+     loc: torch.Tensor,
+     cache_k_nope: torch.Tensor,
+     cache_k_rope: torch.Tensor,
+@@ -445,6 +451,7 @@
+     set_mla_kv_buffer_fp4_quant_scatter_kernel[grid](
+         kv_buffer,
+         kv_scale_buffer,
++        kv_global_scale,
+         cache_k_nope,
+         cache_k_rope,
+         loc,
+@@ -492,6 +499,7 @@
+ def get_mla_kv_buffer_fp4_dequant_kernel(
+     kv_buffer_ptr,
+     kv_scale_buffer_ptr,
++    kv_global_scale_ptr,
+     cache_k_nope_ptr,
+     cache_k_rope_ptr,
+     loc_ptr,
+@@ -508,6 +516,7 @@
+     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+     kv_row_ptr = kv_buffer_ptr + loc * buffer_stride
+     scale_row_ptr = kv_scale_buffer_ptr + loc * scale_stride
++    global_scale = tl.load(kv_global_scale_ptr).to(tl.float32)
+ 
+     nope_offs = tl.arange(0, NOPE_BLOCK)
+     nope_mask = nope_offs < nope_dim
+@@ -517,10 +526,11 @@
+     nope_nibbles = tl.where(
+         (nope_offs & 1) == 0, nope_packed & 0x0F, (nope_packed >> 4) & 0x0F
+     )
+-    nope_scale = tl.load(
+-        scale_row_ptr + (nope_offs // 16), mask=nope_mask, other=127
+-    ).to(tl.float32)
+-    nope_vals = _fp4_e2m1_to_f32(nope_nibbles) * tl.exp2(nope_scale - 127.0)
++    nope_scale_u8 = tl.load(
++        scale_row_ptr + (nope_offs // 16), mask=nope_mask, other=0
++    ).to(tl.uint8)
++    nope_scale = nope_scale_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    nope_vals = _fp4_e2m1_to_f32(nope_nibbles) * nope_scale * global_scale
+     tl.store(
+         cache_k_nope_ptr + pid_loc * nope_stride + nope_offs,
+         nope_vals,
+@@ -538,10 +548,11 @@
+         rope_packed & 0x0F,
+         (rope_packed >> 4) & 0x0F,
+     )
+-    rope_scale = tl.load(
+-        scale_row_ptr + (rope_combined_offs // 16), mask=rope_mask, other=127
+-    ).to(tl.float32)
+-    rope_vals = _fp4_e2m1_to_f32(rope_nibbles) * tl.exp2(rope_scale - 127.0)
++    rope_scale_u8 = tl.load(
++        scale_row_ptr + (rope_combined_offs // 16), mask=rope_mask, other=0
++    ).to(tl.uint8)
++    rope_scale = rope_scale_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    rope_vals = _fp4_e2m1_to_f32(rope_nibbles) * rope_scale * global_scale
+     tl.store(
+         cache_k_rope_ptr + pid_loc * rope_stride + rope_offs,
+         rope_vals,
+@@ -552,6 +563,7 @@
+ def get_mla_kv_buffer_fp4_dequant_triton(
+     kv_buffer: torch.Tensor,
+     kv_scale_buffer: torch.Tensor,
++    kv_global_scale: torch.Tensor,
+     loc: torch.Tensor,
+     cache_k_nope: torch.Tensor,
+     cache_k_rope: torch.Tensor,
+@@ -563,6 +575,7 @@
+     get_mla_kv_buffer_fp4_dequant_kernel[grid](
+         kv_buffer,
+         kv_scale_buffer,
++        kv_global_scale,
+         cache_k_nope,
+         cache_k_rope,
+         loc,
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -1975,7 +1975,7 @@
+         if self.store_dtype != self.dtype:
+             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+ 
+-        return self.kv_buffer[layer_id - self.start_layer]
++        return self.kv_buffer[local_layer_id]
+ 
+     def get_value_buffer(self, layer_id: int):
+         if self.layer_transfer_counter is not None:
+@@ -2160,10 +2160,45 @@
+                     )
+                     for _ in range(self.layer_num)
+                 ]
++                self.kv_global_scale_buffer = torch.ones(
++                    (self.layer_num,), dtype=torch.float32, device=self.device
++                )
++                self._kv_global_scale_initialized = [False] * self.layer_num
+ 
+     def _clear_buffers(self):
+         del self.kv_buffer
+         del self.kv_scale_buffer
++        del self.kv_global_scale_buffer
++        del self._kv_global_scale_initialized
++
++    def _ensure_nvfp4_global_scale(self, layer: RadixAttention) -> torch.Tensor:
++        local_layer_id = layer.layer_id - self.start_layer
++        if not self._kv_global_scale_initialized[local_layer_id]:
++            scale = getattr(layer, "k_scale", None)
++            if scale is None:
++                self.kv_global_scale_buffer[local_layer_id].fill_(1.0)
++            else:
++                if torch.is_tensor(scale):
++                    scale_tensor = scale.detach().to(
++                        device=self.kv_global_scale_buffer.device, dtype=torch.float32
++                    ).reshape(-1)[0]
++                else:
++                    scale_tensor = torch.tensor(
++                        float(scale),
++                        dtype=torch.float32,
++                        device=self.kv_global_scale_buffer.device,
++                    )
++                if self.kv_global_scale_buffer.device.type == "cuda":
++                    major, minor = torch.cuda.get_device_capability(
++                        self.kv_global_scale_buffer.device
++                    )
++                    if major * 10 + minor == 100:
++                        from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_MAX
++
++                        scale_tensor = scale_tensor * E2M1_MAX
++                self.kv_global_scale_buffer[local_layer_id].copy_(scale_tensor)
++            self._kv_global_scale_initialized[local_layer_id] = True
++        return self.kv_global_scale_buffer[local_layer_id : local_layer_id + 1]
+ 
+     def get_contiguous_buf_infos(self):
+         kv_tensors = self.kv_buffer + self.kv_scale_buffer
+@@ -2173,16 +2208,15 @@
+         return kv_data_ptrs, kv_data_lens, kv_item_lens
+ 
+     def get_key_buffer(self, layer_id: int):
++        local_layer_id = layer_id - self.start_layer
+         if self.layer_transfer_counter is not None:
+-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
++            self.layer_transfer_counter.wait_until(local_layer_id)
+ 
+         if self.store_dtype != self.dtype:
+-            cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(
+-                torch.uint8
+-            )
+-            cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
++            cache_k_nope_fp4 = self.kv_buffer[local_layer_id].view(torch.uint8)
++            cache_k_nope_fp4_sf = self.kv_scale_buffer[local_layer_id]
+ 
+-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
++            from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+ 
+             profile = (
+                 _FP4_KV_DEQUANT_PROFILE
+@@ -2194,9 +2228,37 @@
+                 end_event = torch.cuda.Event(enable_timing=True)
+                 start_event.record()
+ 
+-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+-                cache_k_nope_fp4, cache_k_nope_fp4_sf
+-            )
++            if cache_k_nope_fp4.is_cuda:
++                n_tokens = cache_k_nope_fp4.shape[0]
++                loc = torch.arange(n_tokens, dtype=torch.long, device=cache_k_nope_fp4.device)
++                cache_k_nope = torch.empty(
++                    (n_tokens, 1, self.kv_lora_rank),
++                    dtype=torch.bfloat16,
++                    device=cache_k_nope_fp4.device,
++                )
++                cache_k_rope = torch.empty(
++                    (n_tokens, 1, self.qk_rope_head_dim),
++                    dtype=torch.bfloat16,
++                    device=cache_k_nope_fp4.device,
++                )
++                get_mla_kv_buffer_fp4_dequant_triton(
++                    self.kv_buffer[local_layer_id],
++                    self.kv_scale_buffer[local_layer_id],
++                    self.kv_global_scale_buffer[local_layer_id : local_layer_id + 1],
++                    loc,
++                    cache_k_nope,
++                    cache_k_rope,
++                )
++                cache_k_nope_fp4_dequant = torch.cat(
++                    [cache_k_nope, cache_k_rope], dim=-1
++                )
++            else:
++                cache_k_nope_fp4_dequant = NVFP4KVQuantizeUtil.dequantize(
++                    cache_k_nope_fp4,
++                    cache_k_nope_fp4_sf.unsqueeze(1).view(torch.float8_e4m3fn),
++                    self.kv_global_scale_buffer[local_layer_id : local_layer_id + 1],
++                    dtype=torch.bfloat16,
++                )
+ 
+             if profile:
+                 end_event.record()
+@@ -2209,7 +2271,7 @@
+                 )
+             return cache_k_nope_fp4_dequant
+ 
+-        return self.kv_buffer[layer_id - self.start_layer]
++        return self.kv_buffer[local_layer_id]
+ 
+     def get_mla_kv_buffer(
+         self,
+@@ -2259,6 +2321,7 @@
+             get_mla_kv_buffer_fp4_dequant_triton(
+                 self.kv_buffer[local_layer_id],
+                 self.kv_scale_buffer[local_layer_id],
++                self.kv_global_scale_buffer[local_layer_id : local_layer_id + 1],
+                 loc,
+                 cache_k_nope,
+                 cache_k_rope,
+@@ -2268,10 +2331,13 @@
+                 self.kv_buffer[local_layer_id].index_select(0, loc).view(torch.uint8)
+             )
+             cache_k_fp4_sf = self.kv_scale_buffer[local_layer_id].index_select(0, loc)
+-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
++            from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+ 
+-            cache_k_dequant = KVFP4QuantizeUtil.batched_dequantize(
+-                cache_k_fp4, cache_k_fp4_sf, dtype=dst_dtype
++            cache_k_dequant = NVFP4KVQuantizeUtil.dequantize(
++                cache_k_fp4,
++                cache_k_fp4_sf.unsqueeze(1).view(torch.float8_e4m3fn),
++                self.kv_global_scale_buffer[local_layer_id : local_layer_id + 1],
++                dtype=dst_dtype,
+             )
+             cache_k_nope, cache_k_rope = cache_k_dequant.split(
+                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+@@ -2299,20 +2365,22 @@
+         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA-FP4)")
+         layer_id = layer.layer_id
+         assert not self.dsa_kv_cache_store_fp8
++        local_layer_id = layer_id - self.start_layer
++        global_scale = self._ensure_nvfp4_global_scale(layer)
+         if cache_k.dtype != self.dtype:
+-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
++            from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+ 
+-            cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
++            cache_k_fp4, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
++                cache_k.contiguous(), global_scale
++            )
+ 
+         if self.store_dtype != self.dtype:
+-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
++            self.kv_buffer[local_layer_id][loc] = cache_k_fp4.view(self.store_dtype)
++            self.kv_scale_buffer[local_layer_id][loc] = cache_k_fp4_sf.view(
+                 self.store_dtype
+-            )
+-            self.kv_scale_buffer[layer_id - self.start_layer][loc] = (
+-                cache_k_fp4_sf.view(self.store_dtype)
+-            )
++            ).reshape(cache_k.shape[0], -1)
+         else:
+-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
++            self.kv_buffer[local_layer_id][loc] = cache_k
+ 
+     def set_mla_kv_buffer(
+         self,
+@@ -2335,6 +2403,7 @@
+             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+         else:
+             local_layer_id = layer_id - self.start_layer
++            global_scale = self._ensure_nvfp4_global_scale(layer)
+             if (
+                 self.store_dtype != self.dtype
+                 and cache_k_nope.dtype != self.dtype
+@@ -2345,6 +2414,7 @@
+                 set_mla_kv_buffer_fp4_quant_scatter_triton(
+                     self.kv_buffer[local_layer_id],
+                     self.kv_scale_buffer[local_layer_id],
++                    global_scale,
+                     loc,
+                     cache_k_nope,
+                     cache_k_rope,
+@@ -2353,32 +2423,29 @@
+ 
+             if cache_k_nope.dtype != self.dtype:
+                 from sglang.srt.layers.quantization.kvfp4_tensor import (
+-                    KVFP4QuantizeUtil,
++                    NVFP4KVQuantizeUtil,
+                 )
+ 
+-                cache_k_nope_fp4, cache_k_nope_fp4_sf = (
+-                    KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
+-                )
+-                cache_k_rope_fp4, cache_k_rope_fp4_sf = (
+-                    KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
++                cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1).contiguous()
++                cache_k_fp4, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
++                    cache_k, global_scale
+                 )
++            else:
++                cache_k_fp4 = cache_k_nope
++                cache_k_fp4_sf = cache_k_rope
+ 
+             if self.store_dtype != self.dtype:
+-                cache_k_nope = cache_k_nope.view(self.store_dtype)
+-                cache_k_rope = cache_k_rope.view(self.store_dtype)
+-
+-            set_mla_kv_buffer_triton(
+-                self.kv_buffer[local_layer_id],
+-                loc,
+-                cache_k_nope_fp4,
+-                cache_k_rope_fp4,
+-            )
+-            set_mla_kv_scale_buffer_triton(
+-                self.kv_scale_buffer[local_layer_id],
+-                loc,
+-                cache_k_nope_fp4_sf,
+-                cache_k_rope_fp4_sf,
+-            )
++                self.kv_buffer[local_layer_id][loc] = cache_k_fp4.view(self.store_dtype)
++                self.kv_scale_buffer[local_layer_id][loc] = cache_k_fp4_sf.view(
++                    self.store_dtype
++                ).reshape(cache_k_fp4.shape[0], -1)
++            else:
++                set_mla_kv_buffer_triton(
++                    self.kv_buffer[local_layer_id],
++                    loc,
++                    cache_k_nope,
++                    cache_k_rope,
++                )
+ 
+ 
+ class DSATokenToKVPool(MLATokenToKVPool):
+--- a/python/sglang/srt/disaggregation/common/staging_buffer.py
++++ b/python/sglang/srt/disaggregation/common/staging_buffer.py
+@@ -739,6 +739,7 @@
+     page_indices,
+     layer_offset,
+     data_bytes,
++    global_scale,
+     num_tokens,
+     packed_dim: tl.constexpr,
+     scale_dim: tl.constexpr,
+@@ -792,12 +793,13 @@
+     )
+     val = tl.where(sign, -val, val)
+ 
+-    scale = tl.load(
++    scale_u8 = tl.load(
+         staging + layer_offset + data_bytes + t_idx * scale_dim + (dim // 16),
+         mask=mask,
+-        other=127,
+-    )
+-    val = val * tl.exp2(scale.to(tl.float32) - 127.0)
++        other=0,
++    ).to(tl.uint8)
++    block_scale = scale_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    val = val * block_scale * global_scale
+ 
+     tl.store(dst + pool_token * kv_dim + dim, val.to(FP8_DTYPE), mask=mask)
+ 
+@@ -809,6 +811,7 @@
+     page_indices,
+     per_layer_bytes,
+     data_bytes,
++    global_scales_offset,
+     num_tokens,
+     packed_dim: tl.constexpr,
+     scale_dim: tl.constexpr,
+@@ -867,12 +870,15 @@
+     )
+     val = tl.where(sign, -val, val)
+ 
+-    scale = tl.load(
++    scale_u8 = tl.load(
+         staging + layer_offset + data_bytes + t_idx * scale_dim + (dim // 16),
+         mask=mask,
+-        other=127,
+-    )
+-    val = val * tl.exp2(scale.to(tl.float32) - 127.0)
++        other=0,
++    ).to(tl.uint8)
++    block_scale = scale_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    global_scale_ptr = (staging + global_scales_offset).to(tl.pointer_type(tl.float32))
++    global_scale = tl.load(global_scale_ptr + layer_id).to(tl.float32)
++    val = val * block_scale * global_scale
+ 
+     tl.store(dst + pool_token * kv_dim + dim, val.to(FP8_DTYPE), mask=mask)
+ 
+@@ -880,20 +886,21 @@
+ def fp4_mla_staging_nbytes(num_tokens: int, kv_cache_dim: int, num_layers: int) -> int:
+     packed_dim = kv_cache_dim // 2
+     scale_dim = kv_cache_dim // 16
+-    return num_tokens * (packed_dim + scale_dim) * num_layers
++    return num_tokens * (packed_dim + scale_dim) * num_layers + num_layers * 4
+ 
+ 
+ def gather_fp4_mla_to_staging(
+     data_buffers: list,
+     scale_buffers: list,
++    global_scales: Optional[torch.Tensor],
+     page_indices_np,
+     staging_buffer: StagingBuffer,
+     page_size: int,
+     gpu_id: int,
+ ) -> int:
+-    """Gather FP4 MLA packed data and scale buffers into contiguous staging.
++    """Gather NVFP4 MLA packed data and scales into contiguous staging.
+ 
+-    Layout per layer is [packed_data for all tokens][scale bytes for all tokens].
++    Layout is [per-layer packed FP4 data + FP8 block scales][FP32 global scales].
+     """
+     import numpy as np
+ 
+@@ -904,7 +911,8 @@
+     num_tokens = len(page_indices_np) * page_size
+     data_bytes = num_tokens * packed_dim
+     per_layer_bytes = data_bytes + num_tokens * scale_dim
+-    total_bytes = per_layer_bytes * num_layers
++    global_scales_offset = per_layer_bytes * num_layers
++    total_bytes = global_scales_offset + num_layers * 4
+ 
+     device = f"cuda:{gpu_id}"
+     torch.cuda.set_device(gpu_id)
+@@ -940,6 +948,13 @@
+             page_size,
+             BLOCK_SIZE,
+         )
++        global_scale_view = staging_buffer.buffer[
++            global_scales_offset:total_bytes
++        ].view(torch.float32)
++        if global_scales is None:
++            global_scale_view.fill_(1.0)
++        else:
++            global_scale_view.copy_(global_scales[:num_layers], non_blocking=True)
+ 
+     staging_buffer._gather_stream.synchronize()
+     return total_bytes
+@@ -952,13 +967,14 @@
+     page_size: int,
+     kv_cache_dim: int,
+ ) -> None:
+-    """Transcode staged block-FP4 MLA KV directly into FP8 KV cache buffers."""
++    """Transcode staged NVFP4 MLA KV directly into FP8 KV cache buffers."""
+     num_layers = len(kv_buffers)
+     num_tokens = page_idx_tensor.shape[0] * page_size
+     packed_dim = kv_cache_dim // 2
+     scale_dim = kv_cache_dim // 16
+     data_bytes = num_tokens * packed_dim
+     per_layer_bytes = data_bytes + num_tokens * scale_dim
++    global_scales_offset = per_layer_bytes * num_layers
+ 
+     BLOCK_SIZE = 1024
+     dst_ptr_key = tuple(kv.data_ptr() for kv in kv_buffers)
+@@ -975,6 +991,7 @@
+         page_idx_tensor,
+         per_layer_bytes,
+         data_bytes,
++        global_scales_offset,
+         num_tokens,
+         packed_dim,
+         scale_dim,
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -216,6 +216,7 @@
+                     transcode_source="fp4_mla",
+                     fp4_data_buffers=kv_pool.kv_buffer,
+                     fp4_scale_buffers=kv_pool.kv_scale_buffer,
++                    fp4_global_scales=getattr(kv_pool, "kv_global_scale_buffer", None),
+                     kv_cache_dim=kv_pool.kv_cache_dim,
+                 )
+             elif hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+--- a/python/sglang/srt/disaggregation/nixl/conn.py
++++ b/python/sglang/srt/disaggregation/nixl/conn.py
+@@ -1222,17 +1222,17 @@
+                 )
+                 return None
+             from sglang.srt.disaggregation.common.staging_buffer import (
++                fp4_mla_staging_nbytes,
+                 gather_fp4_mla_to_staging,
+             )
+ 
+             data_buffers = self.kv_buffer_tensors["fp4_data_buffers"]
+             scale_buffers = self.kv_buffer_tensors["fp4_scale_buffers"]
++            global_scales = self.kv_buffer_tensors.get("fp4_global_scales")
+             page_size = self.kv_buffer_tensors["page_size"]
+             num_tokens = len(prefill_kv_indices) * page_size
+-            total_bytes = (
+-                num_tokens
+-                * (data_buffers[0].shape[-1] + scale_buffers[0].shape[-1])
+-                * len(data_buffers)
++            total_bytes = fp4_mla_staging_nbytes(
++                num_tokens, self.kv_buffer_tensors["kv_cache_dim"], len(data_buffers)
+             )
+             if not staging_buffer.fits(total_bytes) or dst_staging_size < total_bytes:
+                 logger.warning(
+@@ -1243,6 +1243,7 @@
+             total_bytes = gather_fp4_mla_to_staging(
+                 data_buffers,
+                 scale_buffers,
++                global_scales,
+                 prefill_kv_indices,
+                 staging_buffer,
+                 page_size,
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -509,16 +509,18 @@
+                 )
+                 return -1
+             from sglang.srt.disaggregation.common.staging_buffer import (
++                fp4_mla_staging_nbytes,
+                 gather_fp4_mla_to_staging,
+             )
+ 
+             data_buffers = self.kv_buffer_tensors["fp4_data_buffers"]
+             scale_buffers = self.kv_buffer_tensors["fp4_scale_buffers"]
++            global_scales = self.kv_buffer_tensors.get("fp4_global_scales")
+             page_size = self.kv_buffer_tensors["page_size"]
+             num_tokens = len(prefill_kv_indices) * page_size
+-            packed_dim = data_buffers[0].shape[-1]
+-            scale_dim = scale_buffers[0].shape[-1]
+-            total_bytes = num_tokens * (packed_dim + scale_dim) * len(data_buffers)
++            total_bytes = fp4_mla_staging_nbytes(
++                num_tokens, self.kv_buffer_tensors["kv_cache_dim"], len(data_buffers)
++            )
+             if not staging_buffer.fits(total_bytes):
+                 logger.warning(
+                     f"Prefill FP4 MLA staging too small for {total_bytes} bytes"
+@@ -533,6 +535,7 @@
+             total_bytes = gather_fp4_mla_to_staging(
+                 data_buffers,
+                 scale_buffers,
++                global_scales,
+                 prefill_kv_indices,
+                 staging_buffer,
+                 page_size,
