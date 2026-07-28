@@ -1,8 +1,8 @@
 # flash_mla
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/df022ebafb88578eab9f0300606ee765608d8b5c.tar.gz
-    URL_HASH SHA256=45992d7de7d051dc897aff33156a2b7515d745fc489008adc7924ab884578d52
+    URL      https://${GITHUB_ARTIFACTORY}/LoCinder/FlashMLA/archive/646a7a0959b431abec813110aa3326f2e978783d.tar.gz
+    URL_HASH SHA256=210a0c43ee7559a12af4a8e13ea0b11e3ad32a79cfe927fd8c3281b3bd2a6560
 )
 FetchContent_Populate(repo-flashmla)
 

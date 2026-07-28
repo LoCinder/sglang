@@ -103,6 +103,8 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    is_nvfp4_kvcache: bool = False,
+    kv_global_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -119,6 +121,8 @@ def flash_mla_with_kvcache(
         descale_k: (batch_size), torch.float32. Descaling factors for K, used for fp8 quantization.
         is_fp8_kvcache: bool. Whether the k_cache and v_cache are in fp8 format. For the format of FP8 KV cache, please refer to README.md
         indices: (batch_size, seq_len_q, topk), torch.int32. If not None, sparse attention will be enabled, and only tokens in the `indices` array will be attended to. Invalid indices should be set to -1 or numbers >= total_seq_len_kv. For details about how to set up `indices`, please refer to README.md.
+        is_nvfp4_kvcache: Whether k_cache uses the packed 336-byte NVFP4 V3.2 layout.
+        kv_global_scale: FP32 global dequantization scale for an NVFP4 KV cache.
 
     Returns:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
@@ -130,6 +134,10 @@ def flash_mla_with_kvcache(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
+        if is_nvfp4_kvcache:
+            raise NotImplementedError(
+                "NVFP4 sparse decode currently requires legacy tensor metadata"
+            )
         return _flash_mla_with_kvcache_sched_meta(
             q=q,
             k_cache=k_cache,
@@ -163,7 +171,23 @@ def flash_mla_with_kvcache(
         descale_k is None
     ), "descale_q and descale_k should be both None or both not None"
 
-    if indices is None and q.element_size() == 1:
+    if is_nvfp4_kvcache:
+        assert indices is not None, "NVFP4 currently supports sparse decode only"
+        assert is_fp8_kvcache, "NVFP4 uses the FP8 sparse scheduler metadata"
+        out, softmax_lse, _, _ = (
+            torch.ops.sgl_kernel.sparse_decode_nvfp4_fwd.default(
+                q,
+                k_cache,
+                indices,
+                attn_sink,
+                tile_scheduler_metadata,
+                num_splits,
+                head_dim_v,
+                softmax_scale,
+                kv_global_scale,
+            )
+        )
+    elif indices is None and q.element_size() == 1:
         out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_fp8.default(
             q,
             k_cache,

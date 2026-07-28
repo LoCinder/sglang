@@ -49,6 +49,29 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       static_cast<float>(sm_scale));
 }
 
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sgl_sparse_decode_nvfp4_fwd(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const std::optional<at::Tensor>& attn_sink,
+    std::optional<at::Tensor> tile_scheduler_metadata,
+    std::optional<at::Tensor> num_splits,
+    int64_t d_v,
+    double sm_scale,
+    double kv_global_scale) {
+  return sparse_attn_decode_nvfp4_interface(
+      q,
+      kv,
+      indices,
+      attn_sink,
+      tile_scheduler_metadata,
+      num_splits,
+      static_cast<int>(d_v),
+      static_cast<float>(sm_scale),
+      static_cast<float>(kv_global_scale));
+}
+
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_dense_decode_fwd(
     at::Tensor q,
     const at::Tensor& kcache,
@@ -104,6 +127,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
       "Tensor? extra_topk_length, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
   m.impl("sparse_decode_fwd", torch::kCUDA, &sgl_sparse_decode_fwd);
+
+  m.def(
+      "sparse_decode_nvfp4_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? attn_sink, "
+      "Tensor? tile_scheduler_metadata, Tensor? num_splits, int d_v, float sm_scale, "
+      "float kv_global_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
+  m.impl("sparse_decode_nvfp4_fwd", torch::kCUDA, &sgl_sparse_decode_nvfp4_fwd);
 
   m.def(
       "dense_decode_fwd(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "
